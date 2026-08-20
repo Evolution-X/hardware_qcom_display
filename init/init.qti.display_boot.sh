@@ -105,6 +105,8 @@ case "$target" in
         setprop vendor.display.target.version 3
         setprop vendor.display.enable_fb_scaling 0
         setprop vendor.display.disable_cwb_idle_fallback 1
+        setprop vendor.gralloc.hw_supports_ubwcp 0
+        setprop vendor.gralloc.enable_snapalloc 1
         ;;
         530|531|540)
         setprop vendor.gralloc.use_dma_buf_heaps 1
