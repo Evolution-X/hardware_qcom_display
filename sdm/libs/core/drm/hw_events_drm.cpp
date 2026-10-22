@@ -37,6 +37,7 @@
 #include <sys/prctl.h>
 #include <sys/resource.h>
 #include <sys/types.h>
+#include <unistd.h>
 #include <utils/constants.h>
 #include <utils/debug.h>
 #include <utils/sys.h>
@@ -296,20 +297,24 @@ DisplayError HWEventsDRM::CloseFds() {
   for (uint32_t i = 0; i < event_data_list_.size(); i++) {
     switch (event_data_list_[i].event_type) {
       case HWEvent::VSYNC:
-        if (!is_primary_) {
+        if (!is_primary_ && poll_fds_[i].fd >= 0) {
           Sys::close_(poll_fds_[i].fd);
         }
         poll_fds_[i].fd = -1;
         break;
       case HWEvent::EXIT:
-        Sys::close_(poll_fds_[i].fd);
+        if (poll_fds_[i].fd >= 0) {
+          Sys::close_(poll_fds_[i].fd);
+        }
         poll_fds_[i].fd = -1;
         break;
       case HWEvent::IDLE_NOTIFY:
       case HWEvent::IDLE_POWER_COLLAPSE:
       case HWEvent::PANEL_DEAD:
       case HWEvent::HW_RECOVERY:
-        drmClose(poll_fds_[i].fd);
+        if (poll_fds_[i].fd >= 0) {
+          drmClose(poll_fds_[i].fd);
+        }
         poll_fds_[i].fd = -1;
         break;
       case HWEvent::CEC_READ_MESSAGE:
@@ -346,13 +351,28 @@ void *HWEventsDRM::DisplayEventHandler() {
   while (!exit_threads_) {
     int error = Sys::poll_(poll_fds_.data(), UINT32(poll_fds_.size()), -1);
     if (error <= 0) {
-      DLOGW("poll failed. error = %s", strerror(errno));
+      int poll_errno = errno;
+      DLOGW("poll failed. error = %s", strerror(poll_errno));
+      if (error < 0 && poll_errno != EINTR) {
+        // This is a real time thread, never spin on a persistent poll failure.
+        usleep(kPollErrorBackoffUs);
+      }
       continue;
     }
 
     for (uint32_t i = 0; i < event_data_list_.size(); i++) {
       pollfd &poll_fd = poll_fds_[i];
       if (poll_fd.fd < 0) {
+        continue;
+      }
+
+      if (poll_fd.revents & POLLNVAL) {
+        // The descriptor was closed behind our back. poll() would return at once forever and
+        // this SCHED_FIFO thread would spin, so stop polling this entry. The number is no longer
+        // ours, so it must not be closed either.
+        DLOGE("fd %d of event %d is not open any more, dropping it", poll_fd.fd,
+              static_cast<int>(event_data_list_[i].event_type));
+        poll_fd.fd = -1;
         continue;
       }
 
@@ -549,6 +569,9 @@ void HWEventsDRM::HandlePanelDead(char *data) {
 
   if (size < (int32_t)sizeof(*event_resp)) {
     DLOGE("Invalid event size %d expected %zd\n", size, sizeof(*event_resp));
+    // A DRM descriptor never returns less than one whole event, so this number now refers to
+    // some other file. Stop polling it instead of reading that file again.
+    poll_fds_[panel_dead_index_].fd = -1;
     return;
   }
 

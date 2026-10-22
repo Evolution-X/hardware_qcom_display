@@ -56,6 +56,7 @@ class HWEventsDRM : public HWEventsInterface {
 
  private:
   static const int kMaxStringLength = 1024;
+  static const int kPollErrorBackoffUs = 1000;
 
   typedef void (HWEventsDRM::*EventParser)(char *);
 
