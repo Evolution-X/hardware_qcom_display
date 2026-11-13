@@ -1566,12 +1566,68 @@ HWC3::Error HWCDisplay::PrepareLayerStack(uint32_t *out_num_types, uint32_t *out
   UpdateRefreshRate();
   UpdateActiveConfig();
   DisplayError error = display_intf_->Prepare(&layer_stack_);
+  if ((error == kErrorNone || error == kErrorNeedsCommit) && SkipNonContiguousGpuLayers()) {
+    error = display_intf_->Prepare(&layer_stack_);
+  }
   auto status = HandlePrepareError(error);
   if (status != HWC3::Error::None) {
     return status;
   }
 
   return PostPrepareLayerStack(out_num_types, out_num_requests);
+}
+
+// The strategy can pick GPU composition for layers that are not contiguous in
+// z-order, e.g. sRGB layers below and above a Display P3 layer while the
+// display runs in the DISPLAY_P3 color mode. A single client target cannot be
+// staged correctly then: it ends up above the device layers in between and
+// hides them. Mark the whole range as skip so that it goes to the GPU, which
+// the strategy handles, and prepare again. Secure layers cannot go to the GPU,
+// so leave such stacks alone.
+bool HWCDisplay::SkipNonContiguousGpuLayers() {
+  int first = -1, last = -1, index = 0;
+  for (auto hwc_layer : layer_set_) {
+    if (hwc_layer->GetSDMLayer()->composition == kCompositionGPU) {
+      if (first < 0) {
+        first = index;
+      }
+      last = index;
+    }
+    index++;
+  }
+
+  bool gap = false;
+  index = 0;
+  for (auto hwc_layer : layer_set_) {
+    if (index >= first && index <= last) {
+      Layer *layer = hwc_layer->GetSDMLayer();
+      if (layer->input_buffer.flags.secure || layer->input_buffer.flags.secure_display ||
+          layer->input_buffer.flags.secure_camera) {
+        return false;
+      }
+      if (layer->composition != kCompositionGPU) {
+        gap = true;
+      }
+    }
+    index++;
+  }
+  if (!gap) {
+    return false;
+  }
+
+  index = 0;
+  for (auto hwc_layer : layer_set_) {
+    if (index >= first && index <= last) {
+      Layer *layer = hwc_layer->GetSDMLayer();
+      layer->flags.skip = true;
+      layer->flags.solid_fill = false;
+    }
+    index++;
+  }
+  layer_stack_.flags.skip_present = true;
+  DLOGV_IF(kTagClient, "GPU layers %d-%d not contiguous, composing the range with the GPU",
+           first, last);
+  return true;
 }
 
 HWC3::Error HWCDisplay::HandlePrepareError(DisplayError error) {

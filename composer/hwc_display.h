@@ -493,6 +493,7 @@ class HWCDisplay : public DisplayEventHandler {
   void SetActiveConfigIndex(int active_config_index);
   HWC3::Error PostPrepareLayerStack(uint32_t *out_num_types, uint32_t *out_num_requests);
   HWC3::Error HandlePrepareError(DisplayError error);
+  bool SkipNonContiguousGpuLayers();
   int GetActiveConfigIndex();
   DisplayError ValidateTUITransition(SecureEvent secure_event);
   void MMRMEvent(bool restricted);
