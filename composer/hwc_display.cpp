@@ -865,6 +865,9 @@ void HWCDisplay::BuildLayerStack() {
 
   layer_stack_.flags.geometry_changed =
       UINT32((geometry_changes_ || geometry_changes_on_doze_suspend_) > 0);
+  if (SkipMixedGamutLayers()) {
+    layer_stack_.flags.geometry_changed = 1U;
+  }
   layer_stack_.flags.advance_fb_present = client_target_3_1_set_;
   // Append client target to the layer stack
   Layer *sdm_client_target = client_target_->GetSDMLayer();
@@ -1566,9 +1569,6 @@ HWC3::Error HWCDisplay::PrepareLayerStack(uint32_t *out_num_types, uint32_t *out
   UpdateRefreshRate();
   UpdateActiveConfig();
   DisplayError error = display_intf_->Prepare(&layer_stack_);
-  if ((error == kErrorNone || error == kErrorNeedsCommit) && SkipNonContiguousGpuLayers()) {
-    error = display_intf_->Prepare(&layer_stack_);
-  }
   auto status = HandlePrepareError(error);
   if (status != HWC3::Error::None) {
     return status;
@@ -1577,57 +1577,71 @@ HWC3::Error HWCDisplay::PrepareLayerStack(uint32_t *out_num_types, uint32_t *out
   return PostPrepareLayerStack(out_num_types, out_num_requests);
 }
 
-// The strategy can pick GPU composition for layers that are not contiguous in
-// z-order, e.g. sRGB layers below and above a Display P3 layer while the
-// display runs in the DISPLAY_P3 color mode. A single client target cannot be
-// staged correctly then: it ends up above the device layers in between and
-// hides them. Mark the whole range as skip so that it goes to the GPU, which
-// the strategy handles, and prepare again. Secure layers cannot go to the GPU,
-// so leave such stacks alone.
-bool HWCDisplay::SkipNonContiguousGpuLayers() {
-  int first = -1, last = -1, index = 0;
-  for (auto hwc_layer : layer_set_) {
-    if (hwc_layer->GetSDMLayer()->composition == kCompositionGPU) {
-      if (first < 0) {
-        first = index;
-      }
-      last = index;
-    }
-    index++;
-  }
+// In the DISPLAY_P3 color mode the strategy blends in Display P3: it keeps the
+// Display P3 layers on pipes and sends the layers with other primaries to the
+// GPU. With such layers both below and above a Display P3 one (e.g. an app, the
+// task dim layer, the photo picker, then the taskbar) it still stages the
+// client target above the device layers in between, so the opaque client
+// target hides them. Mark the whole range as skip before the strategy runs: it
+// composes skip ranges with the GPU correctly. Returns true when the range
+// changed since the previous frame. Stacks with secure, video or HDR content
+// are left alone.
+bool HWCDisplay::SkipMixedGamutLayers() {
+  int first = -1, last = -1;
 
-  bool gap = false;
-  index = 0;
-  for (auto hwc_layer : layer_set_) {
-    if (index >= first && index <= last) {
+  if (GetCurrentColorMode() == ColorMode::DISPLAY_P3 && !layer_stack_.flags.secure_present &&
+      !layer_stack_.flags.video_present && !layer_stack_.flags.hdr_present) {
+    std::vector<std::pair<Layer *, bool>> layers;  // layer, composed by the GPU
+    for (auto hwc_layer : layer_set_) {
       Layer *layer = hwc_layer->GetSDMLayer();
-      if (layer->input_buffer.flags.secure || layer->input_buffer.flags.secure_display ||
-          layer->input_buffer.flags.secure_camera) {
-        return false;
+      ColorMetaData csc = {};
+      ColorPrimaries primaries = layer->input_buffer.color_metadata.colorPrimaries;
+      int32_t dataspace = hwc_layer->GetLayerDataspace();
+      if (dataspace != INT32(Dataspace::UNKNOWN) && GetSDMColorSpace(dataspace, &csc)) {
+        primaries = csc.colorPrimaries;
       }
-      if (layer->composition != kCompositionGPU) {
+      layers.push_back({layer, layer->flags.skip || primaries != ColorPrimaries_DCIP3});
+    }
+
+    for (int i = 0; i < INT(layers.size()); i++) {
+      if (layers[i].first->input_buffer.flags.mask_layer || !layers[i].second) {
+        continue;
+      }
+      if (first < 0) {
+        first = i;
+      }
+      last = i;
+    }
+
+    bool gap = false;
+    for (int i = first + 1; first >= 0 && i < last; i++) {
+      if (!layers[i].first->input_buffer.flags.mask_layer && !layers[i].second) {
         gap = true;
       }
     }
-    index++;
-  }
-  if (!gap) {
-    return false;
+
+    if (gap) {
+      for (int i = first; i <= last; i++) {
+        Layer *layer = layers[i].first;
+        if (layer->input_buffer.flags.mask_layer) {
+          continue;
+        }
+        layer->flags.skip = true;
+        layer->flags.solid_fill = false;
+      }
+      layer_stack_.flags.skip_present = true;
+    } else {
+      first = last = -1;
+    }
   }
 
-  index = 0;
-  for (auto hwc_layer : layer_set_) {
-    if (index >= first && index <= last) {
-      Layer *layer = hwc_layer->GetSDMLayer();
-      layer->flags.skip = true;
-      layer->flags.solid_fill = false;
-    }
-    index++;
+  bool changed = (first != mixed_gamut_skip_first_) || (last != mixed_gamut_skip_last_);
+  if (changed) {
+    DLOGI("Mixed gamut GPU range %d-%d", first, last);
   }
-  layer_stack_.flags.skip_present = true;
-  DLOGV_IF(kTagClient, "GPU layers %d-%d not contiguous, composing the range with the GPU",
-           first, last);
-  return true;
+  mixed_gamut_skip_first_ = first;
+  mixed_gamut_skip_last_ = last;
+  return changed;
 }
 
 HWC3::Error HWCDisplay::HandlePrepareError(DisplayError error) {
