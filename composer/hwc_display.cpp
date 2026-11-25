@@ -1842,7 +1842,9 @@ HWC3::Error HWCDisplay::GetHdrCapabilities(uint32_t *out_num_types, int32_t *out
     num_types++;
   }
 
-  if (fixed_info.dolby_vision_supported) {
+  bool dolby_vision_supported = fixed_info.dolby_vision_supported ||
+      (type_ == kBuiltIn && property_get_bool("ro.vendor.display.dolbyvision.support", false));
+  if (dolby_vision_supported) {
     supported_types[num_types] = static_cast<int32_t>(Hdr::DOLBY_VISION);
     num_types++;
   }
